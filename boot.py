@@ -13,6 +13,7 @@ DATABASE_URL = 'postgresql://test:test@localhost/test'
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Создаем экземпляр бота и диспетчера
 bot = Bot(token=API_TOKEN)
@@ -34,48 +35,64 @@ async def create_db():
         );
     ''')
 
-async def add_user_to_db(user_id, username):
+# Функция для отправки пользователям доступных стендов
+async def send_stands(message: types.Message):
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        # Логируем данные перед выполнением запроса
-        logging.info(f"Adding user to database: user_id={user_id}, username={username}")
-        
-        await conn.execute('''
-            INSERT INTO reservations (user_id, username, stand_id, stand_name, task_title, start_time, end_time)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (user_id) DO NOTHING;
-        ''', user_id, username, None, None, None, None, None)
+        stands = await conn.fetch('SELECT stand_id FROM reservations WHERE end_time IS NULL ORDER BY stand_id')
 
-        # Проверяем добавление данных
-        user_row = await conn.fetchrow('SELECT * FROM reservations WHERE user_id = $1', user_id)
-        logging.info(f"User after insert: {user_row}")
+        logger.info(f"Найденные стенды в базе данных: {stands}")
 
+        if stands:
+            keyboard = types.InlineKeyboardMarkup()
+            for stand in stands:
+                # Используем только stand_id в качестве текста кнопки
+                button = types.InlineKeyboardButton(text=str(stand['stand_id']), callback_data=f"book_stand_{stand['stand_id']}")
+                keyboard.add(button)
+
+            await message.reply("Выберите стенд:", reply_markup=keyboard)
+            logger.info("Кнопки стендов успешно отправлены пользователю.")
+        else:
+            await message.reply("Нет доступных стендов.")
+            logger.info("Нет доступных стендов для бронирования.")
     except Exception as e:
-        logging.error(f"Ошибка при добавлении пользователя в базу: {e}")
+        logger.error(f"Ошибка при получении стендов: {e}")
     finally:
         await conn.close()
+        logger.info("Соединение с базой данных закрыто.")
 
-async def user_exists(user_id):
+
+@dp.callback_query_handler(lambda c: c.data.startswith('book_stand_'))
+async def process_stand_booking(callback_query: types.CallbackQuery):
+    stand_id = int(callback_query.data.split('_')[2])
+    user_id = callback_query.from_user.id
+    username = callback_query.from_user.username if callback_query.from_user.username else "no_username"
+    end_time = datetime.datetime.now() + datetime.timedelta(days=3)
+
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        row = await conn.fetchrow('SELECT * FROM reservations WHERE user_id = $1', user_id)
-        return row is not None
+        # Используем INSERT ... ON CONFLICT для добавления или обновления записи по стенду
+        await conn.execute('''
+            INSERT INTO reservations (stand_id, user_id, username, end_time)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (stand_id) 
+            DO UPDATE SET user_id = $2, username = $3, end_time = $4;
+        ''', stand_id, user_id, username, end_time)
+        
+        await callback_query.answer(f"Вы успешно забронировали стенд {stand_id}!")
+        
+    except Exception as e:
+        await callback_query.answer(f"Ошибка при бронировании: {e}")
     finally:
         await conn.close()
 
 @dp.message_handler(commands=['start'])
 async def send_welcome(message: types.Message):
-    user_id = message.from_user.id
-    username = message.from_user.username if message.from_user.username else "no_username"
-
-    if not await user_exists(user_id):
-        await add_user_to_db(user_id, username)
-        await message.reply("Ваши данные добавлены в базу данных.")
-    else:
-        await message.reply("Вы уже зарегистрированы в базе данных.")
+    await send_stands(message)
 
 async def on_startup(dp):
-    await create_db()
+    # Здесь можно добавить код для инициализации базы данных, если это необходимо.
+    logging.info("Bot is ready!")
 
 if __name__ == '__main__':
     loop = asyncio.get_event_loop()
